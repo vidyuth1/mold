@@ -1,19 +1,27 @@
+import streamlit as st
 import json
 import math
 import pandas as pd
-import ipywidgets as widgets
-from IPython.display import display, clear_output
-from google.colab import files
+import io
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 
-COLS = [chr(i) for i in range(ord('A'), ord('O') + 1)] # A to O
-CALIBRATED_GRID = {} # Will hold {'A1': (cx, cy), ...}
+# --- App Configuration ---
+st.set_page_config(page_title="Mould Coordinate Generator", page_icon="🍫", layout="centered")
 
+# --- Globals & Session State ---
+COLS = [chr(i) for i in range(ord('A'), ord('O') + 1)] # A to O
+
+# Streamlit re-runs the script on every interaction. 
+# We use session_state to "remember" the calibration grid between uploads.
+if 'CALIBRATED_GRID' not in st.session_state:
+    st.session_state.CALIBRATED_GRID = {}
+
+# --- Core Logic Functions ---
 def infer_grid_coordinates(cx, cy):
     # If a calibration file hasn't been uploaded, fallback to the basic math division
-    if not CALIBRATED_GRID:
+    if not st.session_state.CALIBRATED_GRID:
         col_w, row_h = 1120 / 15, 620 / 8
         col_idx = int(cx // col_w)
         row_idx = int(cy // row_h) + 1
@@ -24,7 +32,7 @@ def infer_grid_coordinates(cx, cy):
     # Nearest neighbor search against the 120 calibrated grid points
     closest_cell = None
     min_dist = float('inf')
-    for cell_id, (cal_x, cal_y) in CALIBRATED_GRID.items():
+    for cell_id, (cal_x, cal_y) in st.session_state.CALIBRATED_GRID.items():
         dist = math.hypot(cx - cal_x, cy - cal_y)
         if dist < min_dist:
             min_dist = dist
@@ -33,19 +41,16 @@ def infer_grid_coordinates(cx, cy):
     return closest_cell
 
 def calibrate_from_json(json_text):
-    global CALIBRATED_GRID
     try:
         if "canvas" in json_text:
             json_text = json_text.replace(' canvas"', '"').replace('canvas', '')
         data = json.loads(json_text)
         image_metadata = data.get("_via_img_metadata", data)
     except Exception as e:
-        print(f"❌ Error: Failed to parse calibration payload.\nDetails: {e}")
+        st.error(f"❌ Error: Failed to parse calibration payload. Details: {e}")
         return False
 
     all_cavities = []
-
-    # Grab the first image's regions to serve as the calibration map
     first_image_key = list(image_metadata.keys())[0]
     regions = image_metadata[first_image_key].get("regions", [])
 
@@ -57,28 +62,25 @@ def calibrate_from_json(json_text):
             all_cavities.append((cx, cy))
 
     if len(all_cavities) != 120:
-        print(f"⚠ Warning: Calibration requires exactly 120 boxes. Found {len(all_cavities)} in the file.")
+        st.warning(f"⚠ Warning: Calibration requires exactly 120 boxes. Found {len(all_cavities)} in the file.")
         return False
 
-    # Sort primarily by X (left to right) to separate into 15 columns
     all_cavities.sort(key=lambda c: c[0])
-    CALIBRATED_GRID.clear()
+    st.session_state.CALIBRATED_GRID.clear()
 
-    # Split into 15 columns of 8
     for col_idx in range(15):
         col_letter = COLS[col_idx]
         col_chunk = all_cavities[col_idx * 8 : (col_idx + 1) * 8]
-
-        # Sort secondarily by Y (top to bottom) to assign rows 1-8
         col_chunk.sort(key=lambda c: c[1])
 
         for row_idx, (cx, cy) in enumerate(col_chunk):
             cell_id = f"{col_letter}{row_idx + 1}"
-            CALIBRATED_GRID[cell_id] = (cx, cy)
+            st.session_state.CALIBRATED_GRID[cell_id] = (cx, cy)
 
-    print(f"✅ Grid successfully calibrated with 120 exact reference points (A1 to O8)!")
+    st.success("✅ Grid successfully calibrated with 120 exact reference points (A1 to O8)!")
     return True
 
+# --- Excel Styling Functions ---
 def apply_header_styling(worksheet, max_column):
     navy_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
     white_bold_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
@@ -141,10 +143,8 @@ def create_visual_map(workbook, summary_df):
 
     header_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
     header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-
     empty_mould_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
     empty_mould_font = Font(color="9C0006", bold=True)
-
     good_mould_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
     good_mould_font = Font(color="006100")
 
@@ -194,12 +194,11 @@ def process_raw_json(json_text):
     try:
         if "canvas" in json_text:
             json_text = json_text.replace(' canvas"', '"').replace('canvas', '')
-
         data = json.loads(json_text)
         image_metadata = data.get("_via_img_metadata", data)
     except Exception as e:
-        print(f"❌ Error: Failed to parse file payload.\nDetails: {e}")
-        return
+        st.error(f"❌ Error: Failed to parse file payload. Details: {e}")
+        return None
 
     all_output_rows = []
     total_moulds = 0
@@ -234,13 +233,13 @@ def process_raw_json(json_text):
 
     if all_output_rows:
         final_df = pd.DataFrame(all_output_rows)
-
         summary_df = final_df['Grid_Cell'].value_counts().reset_index()
         summary_df.columns = ['Grid_Coordinate', 'Total_Count']
         summary_df['Occurrence_Rate'] = summary_df['Total_Count'] / total_moulds
 
-        output_filename = "mould_cavity_analysis.xlsx"
-        with pd.ExcelWriter(output_filename, engine='openpyxl') as writer:
+        # Write to memory instead of a file on disk
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
             save_with_merged_cells(writer, final_df, 'Detailed Coordinates')
 
             workbook = writer.book
@@ -255,7 +254,7 @@ def process_raw_json(json_text):
             summary_ws.row_dimensions[1].height = 28
 
             for col_idx, col_name in enumerate(summary_df.columns, start=1):
-                cell = summary_ws.cell(row=2, column=col_idx, value=col_name)
+                summary_ws.cell(row=2, column=col_idx, value=col_name)
 
             navy_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
             white_bold_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
@@ -284,49 +283,46 @@ def process_raw_json(json_text):
             autofit_columns(summary_ws)
             create_visual_map(workbook, summary_df)
 
-        print("\n🎉 Successful! Here is the spreadsheet.")
-        files.download(output_filename)
+        return output.getvalue()
     else:
-        print("\n⚠ Processed, but no valid bounding box annotations were found in this file.")
+        st.warning("⚠ Processed, but no valid bounding box annotations were found in this file.")
+        return None
 
-# --- Interactive UI Setup ---
-output_area = widgets.Output()
+# --- Streamlit User Interface ---
 
-def on_calibrate_clicked(b):
-    with output_area:
-        clear_output()
-        print("Upload the Calibration JSON (must contain exactly 120 bounding boxes)...")
-        uploaded = files.upload()
-        for filename in uploaded.keys():
-            file_content = uploaded[filename].decode("utf-8")
-            calibrate_from_json(file_content)
+st.title("🍫 Chocolate Mould Coordinate Generator")
+st.markdown("---")
 
-def on_upload_clicked(b):
-    with output_area:
-        clear_output()
-        if not CALIBRATED_GRID:
-            print("⚠ Note: Using default mathematical grid. Upload a calibration JSON first for high accuracy.")
-        else:
-            print("✨ Using calibrated 120-point coordinate grid.")
+st.header("Step 1: Calibration (Recommended)")
+st.markdown("Upload your 120-box master JSON to calibrate exact positioning. If skipped, standard math grids apply.")
+cal_file = st.file_uploader("Upload Calibration JSON", type=["json"], key="cal")
 
-        uploaded = files.upload()
-        for filename in uploaded.keys():
-            file_content = uploaded[filename].decode("utf-8")
-            process_raw_json(file_content)
+if cal_file is not None:
+    file_content = cal_file.getvalue().decode("utf-8")
+    calibrate_from_json(file_content)
 
-btn_calibrate = widgets.Button(description="1. Upload Calibration JSON", button_style='info', icon='crosshairs', layout=widgets.Layout(width='auto'))
-btn_calibrate.on_click(on_calibrate_clicked)
+st.markdown("---")
 
-btn_upload = widgets.Button(description="2. Upload Analysis JSON", button_style='primary', icon='upload', layout=widgets.Layout(width='auto'))
-btn_upload.on_click(on_upload_clicked)
+st.header("Step 2: Generate Analysis")
+st.markdown("Upload your exported VIA JSON files to process the empty molds.")
 
-box_buttons = widgets.HBox([btn_calibrate, btn_upload])
+if st.session_state.CALIBRATED_GRID:
+    st.info("✨ Using calibrated 120-point coordinate grid.")
+else:
+    st.info("⚠ Using default mathematical grid.")
 
-print("=" * 60)
-print("  CHOCOLATE MOULD COORDINATE GENERATOR (CALIBRATED)")
-print("=" * 60)
-print("Step 1: (Recommended) Upload your 120-box master JSON to calibrate exact positioning.")
-print("Step 2: Upload your exported VIA JSON files to process the empty molds.")
-print("-" * 60)
-display(box_buttons)
-display(output_area)
+analysis_file = st.file_uploader("Upload Analysis JSON", type=["json"], key="analysis")
+
+if analysis_file is not None:
+    with st.spinner("Processing file and building spreadsheet..."):
+        file_content = analysis_file.getvalue().decode("utf-8")
+        excel_data = process_raw_json(file_content)
+        
+        if excel_data:
+            st.success("🎉 Processing successful! Your spreadsheet is ready.")
+            st.download_button(
+                label="📥 Download Excel Report",
+                data=excel_data,
+                file_name="mould_cavity_analysis.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
