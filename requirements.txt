@@ -1,2 +1,4 @@
-pandas
-openpyxl
+streamlit>=1.30
+streamlit-image-coordinates>=0.4.0
+Pillow>=10.0
+pandas>=2.0
