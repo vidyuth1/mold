@@ -1,328 +1,321 @@
-import streamlit as st
+"""
+Mold Well Tracker
+=================
+Streamlit app that lets you upload a photo of a mold (or plate) laid out as
+a 15 x 8 grid (120 coordinates), click anywhere inside a coordinate's cell
+on the image to mark it Empty or Present, and autosaves every click as it
+happens.
+
+Coordinate naming: columns A-O (15), rows 1-8 (8), e.g. "B3" = column B,
+row 3.
+
+How it works
+------------
+1. Upload an image.
+2. Calibrate the grid ONCE per image: click the OUTER TOP-LEFT corner of
+   the grid (just outside cell A1), then the OUTER BOTTOM-RIGHT corner
+   (just outside cell O8). That rectangle is divided evenly into 15 x 8
+   cells.
+3. Switch to "Mark wells" mode and click ANYWHERE inside a cell to toggle
+   it between Present (green) and Empty (red) -- no need to hit a precise
+   point, the whole cell area is clickable. Every click is written to disk
+   immediately -- no save button needed.
+
+All state (which wells are empty + the grid calibration) is stored per-image
+(keyed by a hash of the image bytes) in the `well_data/` folder as JSON, so
+re-uploading the same image later restores exactly where you left off.
+"""
+
+import hashlib
 import json
-import math
+import os
+from io import BytesIO
+
 import pandas as pd
-import io
-from openpyxl.utils.dataframe import dataframe_to_rows
-from openpyxl.utils import get_column_letter
-from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+import streamlit as st
+from PIL import Image, ImageDraw, ImageFont
+from streamlit_image_coordinates import streamlit_image_coordinates
 
-# --- App Configuration ---
-st.set_page_config(page_title="Mould Coordinate Generator", page_icon="🍫", layout="centered")
+# --------------------------------------------------------------------------
+# CONFIG - tweak these to match your mold
+# --------------------------------------------------------------------------
+COLS = 15                       # 15 columns -> labeled A-O
+ROWS = 8                        # 8 rows     -> labeled 1-8   (15 x 8 = 120)
+COL_LABELS = "ABCDEFGHIJKLMNO"  # 15 letters
 
-# --- Globals & Session State ---
-COLS = [chr(i) for i in range(ord('A'), ord('O') + 1)] # A to O
+MAX_DISPLAY_WIDTH = 900         # working image width in pixels
 
-# Streamlit re-runs the script on every interaction. 
-# We use session_state to "remember" the calibration grid between uploads.
-if 'CALIBRATED_GRID' not in st.session_state:
-    st.session_state.CALIBRATED_GRID = {}
+STATE_DIR = "well_data"         # autosave folder (per-image JSON files)
+os.makedirs(STATE_DIR, exist_ok=True)
 
-# --- Core Logic Functions ---
-def infer_grid_coordinates(cx, cy):
-    # If a calibration file hasn't been uploaded, fallback to the basic math division
-    if not st.session_state.CALIBRATED_GRID:
-        col_w, row_h = 1120 / 15, 620 / 8
-        col_idx = int(cx // col_w)
-        row_idx = int(cy // row_h) + 1
-        col_idx = max(0, min(col_idx, 14))
-        row_idx = max(1, min(row_idx, 8))
-        return f"{COLS[col_idx]}{row_idx}"
+PRESENT_FILL = (46, 204, 113)   # green
+EMPTY_FILL = (231, 76, 60)      # red
+CALIB_COLOR = (52, 152, 219)    # blue
+GRID_LINE = (0, 0, 0, 180)
 
-    # Nearest neighbor search against the 120 calibrated grid points
-    closest_cell = None
-    min_dist = float('inf')
-    for cell_id, (cal_x, cal_y) in st.session_state.CALIBRATED_GRID.items():
-        dist = math.hypot(cx - cal_x, cy - cal_y)
-        if dist < min_dist:
-            min_dist = dist
-            closest_cell = cell_id
+st.set_page_config(page_title="Mold Well Tracker", layout="wide")
 
-    return closest_cell
+# --------------------------------------------------------------------------
+# HELPERS
+# --------------------------------------------------------------------------
 
-def calibrate_from_json(json_text):
+def well_ids():
+    """All 120 well ids: A1..O1, A2..O2, ... A8..O8 (row-major)."""
+    return [f"{COL_LABELS[c]}{r + 1}" for r in range(ROWS) for c in range(COLS)]
+
+
+def image_key(file_bytes: bytes) -> str:
+    """Stable id for an uploaded image, used to namespace its saved state."""
+    return hashlib.sha256(file_bytes).hexdigest()[:16]
+
+
+def state_path(key: str) -> str:
+    return os.path.join(STATE_DIR, f"{key}.json")
+
+
+def load_state(key: str) -> dict:
+    path = state_path(key)
+    data = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            data = {}
+    if "wells" not in data or set(data["wells"].keys()) != set(well_ids()):
+        data["wells"] = {w: "present" for w in well_ids()}
+    if "calibration" not in data:
+        data["calibration"] = None  # -> [[x1, y1], [x2, y2]] once calibrated
+    return data
+
+
+def save_state(key: str, data: dict) -> bool:
+    """Write state to disk immediately (this IS the autosave). Returns
+    False (and warns) instead of crashing if the filesystem is read-only."""
     try:
-        if "canvas" in json_text:
-            json_text = json_text.replace(' canvas"', '"').replace('canvas', '')
-        data = json.loads(json_text)
-        image_metadata = data.get("_via_img_metadata", data)
-    except Exception as e:
-        st.error(f"❌ Error: Failed to parse calibration payload. Details: {e}")
+        with open(state_path(key), "w") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except OSError:
+        st.warning(
+            "Could not write autosave file to disk (read-only filesystem?). "
+            "Your changes are still kept for this session — use the "
+            "'Download state (JSON)' button in the sidebar to save manually.",
+            icon="⚠️",
+        )
         return False
 
-    all_cavities = []
-    first_image_key = list(image_metadata.keys())[0]
-    regions = image_metadata[first_image_key].get("regions", [])
 
-    for item in regions:
-        shape = item["shape_attributes"]
-        if "x" in shape:
-            cx = int(round(shape["x"] + (shape["width"] / 2)))
-            cy = int(round(shape["y"] + (shape["height"] / 2)))
-            all_cavities.append((cx, cy))
+def default_calibration(img_w, img_h):
+    """Outer corners of the whole grid rectangle when nothing is calibrated."""
+    margin_x = img_w * 0.04
+    margin_y = img_h * 0.06
+    return [[margin_x, margin_y], [img_w - margin_x, img_h - margin_y]]
 
-    if len(all_cavities) != 120:
-        st.warning(f"⚠ Warning: Calibration requires exactly 120 boxes. Found {len(all_cavities)} in the file.")
-        return False
 
-    all_cavities.sort(key=lambda c: c[0])
-    st.session_state.CALIBRATED_GRID.clear()
+def compute_cell_bounds(calibration, img_w, img_h):
+    """Divide the calibrated rectangle into COLS x ROWS equal cells.
 
-    for col_idx in range(15):
-        col_letter = COLS[col_idx]
-        col_chunk = all_cavities[col_idx * 8 : (col_idx + 1) * 8]
-        col_chunk.sort(key=lambda c: c[1])
+    Returns (bounds, grid_rect):
+      bounds     -> {well_id: (x0, y0, x1, y1)} pixel box for each cell
+      grid_rect  -> (x1, y1, x2, y2) outer edges of the whole grid
+    """
+    if not calibration or len(calibration) != 2:
+        calibration = default_calibration(img_w, img_h)
+    (x1, y1), (x2, y2) = calibration
+    x1, x2 = min(x1, x2), max(x1, x2)
+    y1, y2 = min(y1, y2), max(y1, y2)
+    col_w = (x2 - x1) / COLS
+    row_h = (y2 - y1) / ROWS
+    bounds = {}
+    for r in range(ROWS):
+        for c in range(COLS):
+            wid = f"{COL_LABELS[c]}{r + 1}"
+            cx0 = x1 + c * col_w
+            cy0 = y1 + r * row_h
+            bounds[wid] = (cx0, cy0, cx0 + col_w, cy0 + row_h)
+    return bounds, (x1, y1, x2, y2)
 
-        for row_idx, (cx, cy) in enumerate(col_chunk):
-            cell_id = f"{col_letter}{row_idx + 1}"
-            st.session_state.CALIBRATED_GRID[cell_id] = (cx, cy)
 
-    st.success("✅ Grid successfully calibrated with 120 exact reference points (A1 to O8)!")
-    return True
-
-# --- Excel Styling Functions ---
-def apply_header_styling(worksheet, max_column):
-    navy_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
-    white_bold_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-    thin_border = Border(bottom=Side(style='medium', color="000000"))
-
-    for col in range(1, max_column + 1):
-        cell = worksheet.cell(row=1, column=col)
-        cell.fill = navy_fill
-        cell.font = white_bold_font
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = thin_border
-    worksheet.row_dimensions[1].height = 24
-
-def autofit_columns(worksheet):
-    for col in worksheet.columns:
-        max_len = 0
-        col_letter = get_column_letter(col[0].column)
-        for cell in col:
-            if cell.row == 1 and worksheet.title == 'Coordinate Counts Ranking':
-                continue
-            if cell.value is not None:
-                max_len = max(max_len, len(str(cell.value)))
-        worksheet.column_dimensions[col_letter].width = max(max_len + 4, 12)
-
-def save_with_merged_cells(writer, df, sheet_name):
-    workbook = writer.book
-    worksheet = workbook.create_sheet(title=sheet_name)
-
-    for r in dataframe_to_rows(df, index=False, header=True):
-        worksheet.append(r)
-
-    apply_header_styling(worksheet, df.shape[1])
-    thin_gray = Side(style='thin', color='D9D9D9')
-    cell_border = Border(left=thin_gray, right=thin_gray, top=thin_gray, bottom=thin_gray)
-
-    for row in range(2, worksheet.max_row + 1):
-        for col in range(1, worksheet.max_column + 1):
-            worksheet.cell(row=row, column=col).border = cell_border
-            if col > 1:
-                worksheet.cell(row=row, column=col).alignment = Alignment(horizontal="center")
-
-    start_row = 2
-    max_row = worksheet.max_row
-    while start_row <= max_row:
-        current_val = worksheet.cell(row=start_row, column=1).value
-        end_row = start_row
-        while end_row + 1 <= max_row and worksheet.cell(row=end_row + 1, column=1).value == current_val:
-            end_row += 1
-
-        if end_row > start_row:
-            worksheet.merge_cells(start_row=start_row, start_column=1, end_row=end_row, end_column=1)
-            merged_cell = worksheet.cell(row=start_row, column=1)
-            merged_cell.alignment = Alignment(vertical="center", horizontal="left")
-        start_row = end_row + 1
-
-    autofit_columns(worksheet)
-
-def create_visual_map(workbook, summary_df):
-    map_ws = workbook.create_sheet(title='Visual Mould Map')
-
-    header_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
-    header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-    empty_mould_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-    empty_mould_font = Font(color="9C0006", bold=True)
-    good_mould_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-    good_mould_font = Font(color="006100")
-
-    center_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    thin_border = Border(left=Side(style='thin', color='D9D9D9'),
-                         right=Side(style='thin', color='D9D9D9'),
-                         top=Side(style='thin', color='D9D9D9'),
-                         bottom=Side(style='thin', color='D9D9D9'))
-
-    for i, col_letter in enumerate(COLS):
-        cell = map_ws.cell(row=1, column=i+2, value=col_letter)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = center_align
-        cell.border = thin_border
-        map_ws.column_dimensions[get_column_letter(i+2)].width = 12
-
-    for r in range(1, 9):
-        cell = map_ws.cell(row=r+1, column=1, value=r)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = center_align
-        cell.border = thin_border
-        map_ws.row_dimensions[r+1].height = 40
-        map_ws.column_dimensions['A'].width = 6
-
-    summary_dict = dict(zip(summary_df['Grid_Coordinate'], summary_df['Total_Count']))
-
-    for r in range(1, 9):
-        for c_idx, col_letter in enumerate(COLS):
-            coord = f"{col_letter}{r}"
-            cell = map_ws.cell(row=r+1, column=c_idx+2)
-            cell.alignment = center_align
-            cell.border = thin_border
-
-            if coord in summary_dict:
-                count = summary_dict[coord]
-                cell.value = f"X\n({count})"
-                cell.fill = empty_mould_fill
-                cell.font = empty_mould_font
-            else:
-                cell.value = "OK"
-                cell.fill = good_mould_fill
-                cell.font = good_mould_font
-
-def process_raw_json(json_text):
-    try:
-        if "canvas" in json_text:
-            json_text = json_text.replace(' canvas"', '"').replace('canvas', '')
-        data = json.loads(json_text)
-        image_metadata = data.get("_via_img_metadata", data)
-    except Exception as e:
-        st.error(f"❌ Error: Failed to parse file payload. Details: {e}")
+def find_cell(x, y, grid_rect):
+    """Return the well id whose cell contains point (x, y), or None if the
+    click landed outside the calibrated grid rectangle entirely."""
+    x1, y1, x2, y2 = grid_rect
+    if x < x1 or x > x2 or y < y1 or y > y2:
         return None
+    col_w = (x2 - x1) / COLS
+    row_h = (y2 - y1) / ROWS
+    col = min(int((x - x1) // col_w), COLS - 1) if col_w > 0 else 0
+    row = min(int((y - y1) // row_h), ROWS - 1) if row_h > 0 else 0
+    return f"{COL_LABELS[col]}{row + 1}"
 
-    all_output_rows = []
-    total_moulds = 0
 
-    for unique_id, mould_profile in image_metadata.items():
-        filename = mould_profile.get("filename", unique_id)
-        regions = mould_profile.get("regions", [])
+def draw_grid_overlay(base_img, bounds, wells, show_labels, calibration_points=None):
+    img = base_img.convert("RGBA")
+    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    font = ImageFont.load_default()
+    for wid, (x0, y0, x1, y1) in bounds.items():
+        present = wells.get(wid, "present") == "present"
+        fill = (*PRESENT_FILL, 80) if present else (*EMPTY_FILL, 130)
+        draw.rectangle([x0, y0, x1, y1], fill=fill, outline=GRID_LINE)
+        if show_labels:
+            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+            draw.text((cx, cy), wid, fill=(0, 0, 0, 255), font=font, anchor="mm")
+    if calibration_points:
+        for (x, y) in calibration_points:
+            r = 9
+            draw.ellipse([x - r, y - r, x + r, y + r], outline=(*CALIB_COLOR, 255), width=3)
+    return Image.alpha_composite(img, layer).convert("RGB")
 
-        total_moulds += 1
-        if not regions:
-            continue
 
-        mould_cavities = []
-        for idx, item in enumerate(regions):
-            shape = item["shape_attributes"]
-            if "x" in shape:
-                cx = int(round(shape["x"] + (shape["width"] / 2)))
-                cy = int(round(shape["y"] + (shape["height"] / 2)))
-                grid_cell = infer_grid_coordinates(cx, cy)
-                mould_cavities.append({"cx": cx, "cy": cy, "inferred": grid_cell})
+def resize_working(img: Image.Image, max_w: int) -> Image.Image:
+    if img.width <= max_w:
+        return img.copy()
+    ratio = max_w / img.width
+    return img.resize((max_w, int(img.height * ratio)), Image.LANCZOS)
 
-        mould_cavities = sorted(mould_cavities, key=lambda val: (val["cy"], val["cx"]))
 
-        for relative_idx, cavity in enumerate(mould_cavities):
-            all_output_rows.append({
-                "Mould_File": filename,
-                "Box_Index": relative_idx + 1,
-                "Center_X": cavity["cx"],
-                "Center_Y": cavity["cy"],
-                "Grid_Cell": cavity["inferred"]
-            })
+# --------------------------------------------------------------------------
+# UI
+# --------------------------------------------------------------------------
 
-    if all_output_rows:
-        final_df = pd.DataFrame(all_output_rows)
-        summary_df = final_df['Grid_Cell'].value_counts().reset_index()
-        summary_df.columns = ['Grid_Coordinate', 'Total_Count']
-        summary_df['Occurrence_Rate'] = summary_df['Total_Count'] / total_moulds
+st.title("🧫 Mold Well Tracker")
+st.caption(
+    f"Upload a mold photo, calibrate the {COLS}x{ROWS} grid once, then click "
+    "anywhere inside a coordinate's cell to mark it Empty / Present. "
+    "Every click is saved automatically."
+)
 
-        # Write to memory instead of a file on disk
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            save_with_merged_cells(writer, final_df, 'Detailed Coordinates')
+uploaded = st.file_uploader("Upload mold image", type=["png", "jpg", "jpeg"])
 
-            workbook = writer.book
-            summary_ws = workbook.create_sheet(title='Coordinate Counts Ranking')
+if uploaded is None:
+    st.info("Upload an image to get started.")
+    st.stop()
 
-            summary_ws.merge_cells('A1:C1')
-            banner_cell = summary_ws['A1']
-            banner_cell.value = f"📊 Total Unique Molds Evaluated: {total_moulds}"
-            banner_cell.font = Font(name="Calibri", size=11, bold=True, color="1F497D")
-            banner_cell.fill = PatternFill(start_color="F2F5F8", end_color="F2F5F8", fill_type="solid")
-            banner_cell.alignment = Alignment(horizontal="left", vertical="center")
-            summary_ws.row_dimensions[1].height = 28
+file_bytes = uploaded.getvalue()
+key = image_key(file_bytes)
+state = load_state(key)
 
-            for col_idx, col_name in enumerate(summary_df.columns, start=1):
-                summary_ws.cell(row=2, column=col_idx, value=col_name)
+raw_img = Image.open(BytesIO(file_bytes))
+work_img = resize_working(raw_img, MAX_DISPLAY_WIDTH)
+img_w, img_h = work_img.size
 
-            navy_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
-            white_bold_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-            for col in range(1, summary_df.shape[1] + 1):
-                c = summary_ws.cell(row=2, column=col)
-                c.fill = navy_fill
-                c.font = white_bold_font
-                c.alignment = Alignment(horizontal="center", vertical="center")
-            summary_ws.row_dimensions[2].height = 24
+# ---- sidebar -------------------------------------------------------------
+with st.sidebar:
+    st.header("Controls")
+    mode = st.radio("Mode", ["Mark wells", "Calibrate grid"], index=0)
+    show_labels = st.checkbox("Show cell labels", value=True)
 
-            for r_idx, row_data in enumerate(dataframe_to_rows(summary_df, index=False, header=False), start=3):
-                for c_idx, val in enumerate(row_data, start=1):
-                    summary_ws.cell(row=r_idx, column=c_idx, value=val)
+    st.divider()
+    present_count = sum(1 for v in state["wells"].values() if v == "present")
+    empty_count = len(state["wells"]) - present_count
+    c1, c2 = st.columns(2)
+    c1.metric("Present", present_count)
+    c2.metric("Empty", empty_count)
 
-            thin_gray = Side(style='thin', color='D9D9D9')
-            cell_border = Border(left=thin_gray, right=thin_gray, top=thin_gray, bottom=thin_gray)
+    st.divider()
+    if st.button("Reset all wells to Present", use_container_width=True):
+        state["wells"] = {w: "present" for w in well_ids()}
+        save_state(key, state)
+        st.rerun()
+    if st.button("Reset calibration", use_container_width=True):
+        state["calibration"] = None
+        save_state(key, state)
+        st.rerun()
 
-            for row in range(3, summary_ws.max_row + 1):
-                for col in range(1, summary_ws.max_column + 1):
-                    cell = summary_ws.cell(row=row, column=col)
-                    cell.border = cell_border
-                    cell.alignment = Alignment(horizontal="center")
-                    if col == 3:
-                        cell.number_format = '0.0%'
+    st.divider()
+    export_df = pd.DataFrame(
+        [{"well": w, "status": s} for w, s in state["wells"].items()]
+    )
+    st.download_button(
+        "Download results (CSV)",
+        export_df.to_csv(index=False).encode("utf-8"),
+        file_name=f"mold_{key}_wells.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    st.download_button(
+        "Download state (JSON)",
+        json.dumps(state, indent=2).encode("utf-8"),
+        file_name=f"mold_{key}_state.json",
+        mime="application/json",
+        use_container_width=True,
+    )
 
-            autofit_columns(summary_ws)
-            create_visual_map(workbook, summary_df)
+    restore_file = st.file_uploader(
+        "Restore a previously downloaded state (JSON)", type=["json"], key="restore"
+    )
+    if restore_file is not None:
+        try:
+            restored = json.load(restore_file)
+            if "wells" in restored:
+                state["wells"].update(restored["wells"])
+            if restored.get("calibration"):
+                state["calibration"] = restored["calibration"]
+            save_state(key, state)
+            st.success("State restored.")
+            st.rerun()
+        except (json.JSONDecodeError, KeyError):
+            st.error("That file doesn't look like a valid state export.")
 
-        return output.getvalue()
-    else:
-        st.warning("⚠ Processed, but no valid bounding box annotations were found in this file.")
-        return None
+bounds, grid_rect = compute_cell_bounds(state["calibration"], img_w, img_h)
 
-# --- Streamlit User Interface ---
+# ---- main panel ------------------------------------------------------
+if mode == "Calibrate grid":
+    st.subheader("Step 1 — Calibrate the grid")
+    st.write(
+        "Click the **outer top-left corner of the grid** (just outside "
+        "coordinate A1), then click the **outer bottom-right corner** "
+        f"(just outside coordinate {COL_LABELS[-1]}{ROWS}). The rectangle "
+        f"between those two clicks is divided evenly into {COLS} x {ROWS} "
+        "cells. Click again afterwards to re-calibrate from scratch."
+    )
+    calib_points = state["calibration"] or []
+    overlay = draw_grid_overlay(work_img, bounds, state["wells"], show_labels, calib_points)
+    click = streamlit_image_coordinates(overlay, key=f"calib_{key}")
 
-st.title("🍫 Chocolate Mould Coordinate Generator")
-st.markdown("---")
+    last_key = f"last_calib_click_{key}"
+    if click is not None:
+        click_sig = (click.get("x"), click.get("y"))
+        if click_sig != (None, None) and st.session_state.get(last_key) != click_sig:
+            st.session_state[last_key] = click_sig
+            pts = state["calibration"] or []
+            if len(pts) >= 2:
+                pts = []
+            pts.append([click_sig[0], click_sig[1]])
+            state["calibration"] = pts
+            save_state(key, state)
+            st.rerun()
 
-st.header("Step 1: Calibration (Recommended)")
-st.markdown("Upload your 120-box master JSON to calibrate exact positioning. If skipped, standard math grids apply.")
-cal_file = st.file_uploader("Upload Calibration JSON", type=["json"], key="cal")
+    if state["calibration"] and len(state["calibration"]) == 2:
+        st.success("Calibration complete — switch to 'Mark wells' in the sidebar.")
+    elif state["calibration"] and len(state["calibration"]) == 1:
+        st.info("First corner recorded. Now click the bottom-right outer corner.")
 
-if cal_file is not None:
-    file_content = cal_file.getvalue().decode("utf-8")
-    calibrate_from_json(file_content)
-
-st.markdown("---")
-
-st.header("Step 2: Generate Analysis")
-st.markdown("Upload your exported VIA JSON files to process the empty molds.")
-
-if st.session_state.CALIBRATED_GRID:
-    st.info("✨ Using calibrated 120-point coordinate grid.")
 else:
-    st.info("⚠ Using default mathematical grid.")
+    st.subheader("Click anywhere inside a coordinate's cell to toggle it")
+    overlay = draw_grid_overlay(work_img, bounds, state["wells"], show_labels)
+    click = streamlit_image_coordinates(overlay, key=f"mark_{key}")
 
-analysis_file = st.file_uploader("Upload Analysis JSON", type=["json"], key="analysis")
+    last_key = f"last_mark_click_{key}"
+    if click is not None:
+        click_sig = (click.get("x"), click.get("y"))
+        if click_sig != (None, None) and st.session_state.get(last_key) != click_sig:
+            st.session_state[last_key] = click_sig
+            wid = find_cell(click_sig[0], click_sig[1], grid_rect)
+            if wid:
+                state["wells"][wid] = "empty" if state["wells"][wid] == "present" else "present"
+                save_state(key, state)
+                st.rerun()
+            else:
+                st.toast("That click landed outside the calibrated grid.")
 
-if analysis_file is not None:
-    with st.spinner("Processing file and building spreadsheet..."):
-        file_content = analysis_file.getvalue().decode("utf-8")
-        excel_data = process_raw_json(file_content)
-        
-        if excel_data:
-            st.success("🎉 Processing successful! Your spreadsheet is ready.")
-            st.download_button(
-                label="📥 Download Excel Report",
-                data=excel_data,
-                file_name="mould_cavity_analysis.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+st.caption(
+    f"Legend: 🟢 present &nbsp;&nbsp; 🔴 empty &nbsp;&nbsp; "
+    f"Grid: {COLS} cols (A-{COL_LABELS[-1]}) x {ROWS} rows (1-{ROWS}) = {COLS * ROWS} wells."
+)
+
+with st.expander("Show empty well list"):
+    empty_wells = [w for w, s in state["wells"].items() if s == "empty"]
+    st.write(", ".join(empty_wells) if empty_wells else "None marked empty yet.")
